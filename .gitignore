@@ -1,0 +1,31 @@
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Nsight Compute / Systems profiles
+*.ncu-rep
+*.nsys-rep
+*.qdrep
+*.sqlite
+
+# Generated profiling harnesses (written by the notebook)
+prof_*.py
+
+# Triton / torch caches
+.triton/
+.torchinductor_cache/
+
+# Model weights
+*.pt
+*.pth
+*.bin
+*.safetensors
