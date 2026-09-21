@@ -216,8 +216,7 @@ class Llama(nn.Module):
             norm=RMSNorm(cfg.dim, cfg.norm_eps),
         ))
         self.lm_head = nn.Linear(cfg.dim, cfg.vocab_size, bias=False)
-        # TIED. Without this the model is 1.50B params / 3.0 GB and every
-        # roofline number in the writeup is wrong.
+        
         self.lm_head.weight = self.model.embed_tokens.weight
 
         self.cos, self.sin = None, None
