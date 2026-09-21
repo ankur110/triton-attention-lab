@@ -5,6 +5,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from kernels import fa2_fwd, flash_decode
+
 @dataclass
 class LlamaConfig:
     vocab_size: int = 128256
@@ -138,6 +140,9 @@ class Attention(nn.Module):
         self.k_cache = None
         self.v_cache = None
 
+        self.attn_impl = "sdpa" 
+        
+
     def setup_cache(self, batch_size, max_seq_len, dtype, device):
         shape = (batch_size, self.n_kv_heads, max_seq_len, self.head_dim)
         self.k_cache = torch.zeros(shape, dtype=dtype, device=device)
@@ -148,26 +153,34 @@ class Attention(nn.Module):
             return 0
         return (self.k_cache.numel()+self.v_cache.numel())*self.k_cache.element_size()
 
-    def forward(self,x,cos,sin,start_pos,use_cache):
-        B,T,C=x.shape
-
-        q=self.q_proj(x).view(B,T,self.n_heads,self.head_dim).transpose(1,2)
-        k=self.k_proj(x).view(B,T,self.n_kv_heads,self.head_dim).transpose(1,2)
-        v=self.v_proj(x).view(B,T,self.n_kv_heads,self.head_dim).transpose(1,2)
-        q,k=apply_rope(q,k,cos,sin)
+    def forward(self, x, cos, sin, start_pos, use_cache):
+        B, T, C = x.shape
+        q = self.q_proj(x).view(B, T, self.n_heads,    self.head_dim).transpose(1, 2)
+        k = self.k_proj(x).view(B, T, self.n_kv_heads, self.head_dim).transpose(1, 2)
+        v = self.v_proj(x).view(B, T, self.n_kv_heads, self.head_dim).transpose(1, 2)
+        q, k = apply_rope(q, k, cos, sin)
 
         if use_cache:
-            self.k_cache[:B,:,start_pos:start_pos+T]=k
-            self.v_cache[:B,:,start_pos:start_pos+T]=v
-            k=self.k_cache[:B,:,:start_pos+T]
-            v=self.v_cache[:B,:,:start_pos+T]
+            self.k_cache[:B, :, start_pos:start_pos + T] = k
+            self.v_cache[:B, :, start_pos:start_pos + T] = v
+            k = self.k_cache[:B, :, :start_pos + T]
+            v = self.v_cache[:B, :, :start_pos + T]
 
-        k=repeat_kv(k,self.n_rep)
-        v=repeat_kv(v,self.n_rep)
+        if self.attn_impl == "sdpa":            
+            y = F.scaled_dot_product_attention(q, repeat_kv(k, self.n_rep),
+                                               repeat_kv(v, self.n_rep), is_causal=T > 1)
+        elif self.attn_impl == "sdpa_gqa":      
+            y = F.scaled_dot_product_attention(q, k, v, is_causal=T > 1, enable_gqa=True)
+        elif self.attn_impl == "triton":
+            if T > 1:                           
+                assert start_pos == 0, "causal prefill assumes S_q == S_kv"
+                y, _ = fa2_fwd(q, k, v, causal=True)
+            else:                               
+                y = flash_decode(q[:, :, 0], k, v, self.seq_lens[:B]).unsqueeze(2)
+        else:
+            raise ValueError(self.attn_impl)
 
-        causal=T>1
-        y=F.scaled_dot_product_attention(q,k,v,is_causal=causal)
-        y=y.transpose(1,2).contiguous().view(B,T,C)
+        y = y.transpose(1, 2).contiguous().view(B, T, C)
         return self.o_proj(y)
 
 # ----------------------------------------------------------------------------
@@ -222,13 +235,20 @@ class Llama(nn.Module):
         self.cos, self.sin = None, None
 
     def setup_caches(self, batch_size, max_seq_len, dtype, device):
-            for blk in self.model.layers:
-                blk.self_attn.setup_cache(batch_size, max_seq_len, dtype, device)
-    
+        self.seq_lens = torch.zeros(batch_size, dtype=torch.int32, device=device)
+        for blk in self.model.layers:
+            blk.self_attn.setup_cache(batch_size, max_seq_len, dtype, device)
+            blk.self_attn.seq_lens = self.seq_lens          # one shared buffer
+
     def free_caches(self):
         for blk in self.model.layers:
             blk.self_attn.k_cache = None
             blk.self_attn.v_cache = None
+            blk.self_attn.seq_lens = None
+
+    def set_attn_impl(self, impl):
+        for blk in self.model.layers:
+            blk.self_attn.attn_impl = impl
 
     def cache_bytes(self):
         return sum(blk.self_attn.cache_bytes() for blk in self.model.layers)
@@ -236,20 +256,19 @@ class Llama(nn.Module):
     def init_rope(self, device):
         self.cos, self.sin = precompute_rope(self.cfg, device)
 
-    def forward(self, idx, start_pos: int = 0, use_cache: bool = False):
-            B, T = idx.shape
-            x = self.model.embed_tokens(idx)
-    
-            
-    
-            cos = self.cos[start_pos : start_pos + T].to(x.dtype)
-            sin = self.sin[start_pos : start_pos + T].to(x.dtype)
-    
-            for blk in self.model.layers:
-                x = blk(x, cos, sin, start_pos, use_cache)
-    
-            x = self.model.norm(x)
-            return self.lm_head(x)
+    def forward(self, idx, start_pos: int = 0, use_cache: bool = False, last_only: bool = False):
+        B, T = idx.shape
+        x = self.model.embed_tokens(idx)
+        cos = self.cos[start_pos:start_pos + T].to(x.dtype)
+        sin = self.sin[start_pos:start_pos + T].to(x.dtype)
+        if use_cache:
+            self.seq_lens.fill_(start_pos + T)   
+        for blk in self.model.layers:
+            x = blk(x, cos, sin, start_pos, use_cache)
+        if last_only:
+            x = x[:, -1:]
+        x = self.model.norm(x)
+        return self.lm_head(x)
     
     # -- weight loading -----------------------------------------------------
     
