@@ -1,8 +1,8 @@
 # Flash Attention 2 in Triton
 
-A FlashAttention-2 forward kernel written from scratch in Triton, with grouped-query
-attention (GQA) and causal masking, benchmarked against PyTorch SDPA's FLASH backend
-and a naive eager implementation.
+FlashAttention-2 forward and Flash-Decoding kernels written from scratch in Triton, with
+grouped-query attention (GQA) and causal masking, benchmarked against PyTorch SDPA and a
+naive eager implementation, then run end-to-end inside a from-scratch Llama-3.2-1B.
 
 All numbers below are from an A100-SXM4-40GB (torch 2.8.0+cu128, triton 3.4.0),
 fp16, `H=32` query heads, `H_kv=8` KV heads, `head_dim=64`, batch 1, causal.
@@ -11,11 +11,12 @@ fp16, `H=32` query heads, `H_kv=8` KV heads, `head_dim=64`, batch 1, causal.
 
 | Path | What it is |
 | --- | --- |
-| `fa2_fwd.py` | The kernel. `_fa2_fwd` (the `@triton.jit` kernel) and `fa2_fwd` (the launcher). |
-| `fa2_mod.py` | A copy of `fa2_fwd.py`, written by the notebook so subprocesses can import the kernel by module name. Do not edit it directly. |
-| `fa_bench_notebook.ipynb` | Correctness checks, the block/warp/stage sweep, the head-to-head benchmark, and the bandwidth analysis. |
-| `model/llama3_1b.py` | Llama-3.2-1B from scratch (GQA, RoPE, KV cache). The consumer the kernel is aimed at. |
-| `*.csv` | Committed results from the notebook runs above, so the numbers are readable without a GPU. Re-running the notebook overwrites them. |
+| `kernels/fa2_fwd.py` | The prefill kernel. `_fa2_fwd` (the `@triton.jit` kernel) and `fa2_fwd` (the launcher). |
+| `kernels/flash_decode.py` | The decode kernel. Split-KV Flash-Decoding for the `S_q == 1` case. |
+| `benchmarks/fa_bench_notebook.ipynb` | Correctness checks, the block/warp/stage sweep, the prefill benchmark, and the bandwidth analysis. |
+| `benchmarks/final_benchmark.ipynb` | End-to-end: decode bandwidth, split sweep, TTFT / TPOT, launch-overhead breakdown. |
+| `model/llama3_1b.py` | Llama-3.2-1B from scratch (GQA, RoPE, KV cache). The consumer the kernels are aimed at. |
+| `results/*.csv` | Committed results, so the numbers are readable without a GPU. Re-running a notebook overwrites them. |
 
 ## The kernel
 
@@ -39,6 +40,8 @@ copy.
 
 ## Results
 
+### Prefill
+
 Forward pass, `p50` of `triton.testing.do_bench`, causal:
 
 | S | eager | SDPA flash | ours (64/64/4/2) | ours vs flash |
@@ -54,12 +57,43 @@ warp-specialized pipelining and register-level tiling to pay off.
 A 60-point sweep over `BLOCK_M ∈ {64, 128}`, `BLOCK_N ∈ {32, 64, 128}`,
 `num_warps ∈ {4, 8}`, `num_stages ∈ {2, 3}` picks `64/64/4/2` at every sequence
 length, and `triton.autotune` over the same space finds nothing better — within
-noise of the hand-picked default. The sweep is in `sweep_configs.csv`.
+noise of the hand-picked default. The sweep is in `results/sweep_configs.csv`.
 
 Correctness is checked against a float64 reference computed a few heads at a time,
 with the tolerance set to SDPA-flash's own error against that reference rather than a
 fixed epsilon, so the kernel is held to "no worse than flash" instead of an arbitrary
 threshold. `lse` lands at ~1e-7 relative error.
+
+### Decode
+
+`S_q = 1`, B=1, fp16, KV cache of `S` tokens. `p50` of `do_bench`:
+
+| S | SDPA GQA | flash-decode | pure KV read |
+| --- | --- | --- | --- |
+| 4096 | 31.5 us | **22.6 us** | 32.8 us |
+| 32768 | 90.8 us | **80.0 us** | 90.0 us |
+| 131072 | 234.6 us | **234.0 us** | 267.1 us |
+
+Takeaways:
+
+- **Decode is bandwidth-bound, and the kernel hits the floor** — at every `S` it is at or
+  under the time it takes to merely `.sum()` the same K/V tensors.
+- **Splitting the KV axis is what buys it** — at `S=32k`, 1 split is 545 us, 8 splits 89 us,
+  32 splits 81 us, 64 splits 85 us. 6.7x from parallelism alone, with a knee at 8.
+- **The gain is a small-batch effect** — at B=16 splitting does nothing (846 us split vs
+  847 us unsplit); 16x32 CTAs already fill the GPU, so there is no idle SM to hand work to.
+- **The prefill kernel is the wrong tool for decode** — driven at `S_q = 1` it flatlines at
+  ~70 GB/s regardless of `S`, 15x slower than flash-decode at 128k. Hence a separate kernel.
+- **TPOT is flat across context** — 13.4 ms at both 1k and 128k context, while plain SDPA
+  degrades 10.8 -> 53.8 ms. That flatness is the whole point of flash-decode.
+- **Those TPOT numbers are CPU-bound, not kernel-bound** — at 8k context the triton path is
+  the *fastest* on GPU time (5.00 ms vs SDPA's 7.39 ms) and the *slowest* on wall clock,
+  because its launch gap is 11.2 ms. A 32% GPU-time win that the eager Python loop spends.
+  CUDA graphs would recover it.
+- **TTFT is a wash** — prefill at 8192 tokens is 138 ms vs SDPA's 129 ms, matching the ~25%
+  prefill-kernel gap above once it is diluted by the rest of the model.
+- **End-to-end correctness holds** — 64/64 greedy tokens match the SDPA reference, max logit
+  diff 1.6e-2 (fp16 accumulation noise).
 
 ## Why it is slower at long S
 
@@ -70,7 +104,7 @@ those requests are L2 hits, not DRAM traffic: the unavoidable DRAM footprint (Q,
 K, V, LSE, once each) is just 84.9 MB. The kernel is riding cache reuse, and the
 remaining gap to SDPA is compute-side pipelining, not a memory problem.
 
-`l2_residency.csv` isolates that: holding FLOPs and grid shape fixed while growing
+`results/l2_residency.csv` isolates that: holding FLOPs and grid shape fixed while growing
 the KV footprint past L2's 40 MB shows throughput flattening rather than falling off
 a cliff, since the causal schedule re-reads recent K/V blocks while they are still hot.
 
@@ -80,7 +114,7 @@ Needs a CUDA GPU, Ampere or newer (SM 8.0+) — the SDPA FLASH baseline requires
 
 ```python
 import torch
-from fa2_fwd import fa2_fwd
+from kernels import fa2_fwd
 
 q = torch.randn(1, 32, 4096, 64, device="cuda", dtype=torch.float16)
 k = torch.randn(1,  8, 4096, 64, device="cuda", dtype=torch.float16)
@@ -88,16 +122,15 @@ v = torch.randn(1,  8, 4096, 64, device="cuda", dtype=torch.float16)
 o, lse = fa2_fwd(q, k, v, causal=True)
 ```
 
-For the full picture run `fa_bench_notebook.ipynb` top to bottom; it needs
-`torch`, `triton` and `pandas`. The sweep cell takes a few minutes.
+Run the notebooks in `benchmarks/` from inside that directory; they need `torch`,
+`triton`, `pandas` and (for `final_benchmark.ipynb`) `transformers`. The sweep cell
+takes a few minutes.
 
 ## Status
 
-Forward only. Planned next:
+Forward only: prefill and decode, both wired into `model/`. Planned next:
 
-- **TTFT / TPOT benchmarks** — prefill vs decode latency, wiring the kernel into the
-  KV-cache path in `model/`. The benchmarks here all measure prefill-shaped work.
-- **Backward pass** — `fa2_bwd.py`, using the `lse` the forward already saves.
+- **Backward pass** — `kernels/fa2_bwd.py`, using the `lse` the forward already saves.
 
 Not planned: Nsight Compute profiling. The dev box is a Lightning AI studio, where
 `ncu` returns `ERR_NVGPUCTRPERM` because GPU performance counters are restricted, so
